@@ -23,6 +23,7 @@ defmodule Mob.Cellular.MixProject do
           "README.md",
           "docs/CARRIER_DECISION.md",
           "docs/COST_AND_BATTERY.md",
+          "docs/HARDWARE_VALIDATION.md",
           "CHANGELOG.md",
           "LICENSE"
         ]
@@ -64,6 +65,7 @@ defmodule Mob.Cellular.MixProject do
       files: ~w(
         lib
         priv/mob_plugin.exs
+        scripts
         docs
         mix.exs
         README.md

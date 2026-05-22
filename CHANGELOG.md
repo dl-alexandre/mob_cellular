@@ -12,6 +12,8 @@
 - Added GitHub Actions CI, Credo, Dialyxir, `mix check`, and `CONTRIBUTING.md`.
 - Expanded `PushBridge` tests for delivery, broadcast, payload limits, and
   Telemetry assertions.
+- Added an attached-hardware validation harness and documentation that records
+  local bridge/fallback checks plus FCM/APNs readiness blockers.
 
 ## 0.1.0
 
