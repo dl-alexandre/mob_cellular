@@ -21,8 +21,11 @@ defmodule Mob.Cellular.PushBridge do
 
   @envelope_version 1
   @default_payload_budget 3_500
+  @default_broadcast_timeout 5_000
 
   @type push_client :: module()
+  @type envelope :: map()
+  @type broadcast_result :: %{optional(term()) => :ok | {:error, term()}}
   @type state :: %{
           event_target: pid(),
           config: keyword() | map(),
@@ -37,6 +40,16 @@ defmodule Mob.Cellular.PushBridge do
     end
   end
 
+  def child_spec(opts) do
+    %{
+      id: Keyword.get(opts, :id, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      restart: :permanent,
+      shutdown: 5_000,
+      type: :worker
+    }
+  end
+
   @doc """
   Injects an inbound push payload into the bridge.
 
@@ -47,6 +60,19 @@ defmodule Mob.Cellular.PushBridge do
   @spec receive_push(GenServer.server(), map()) :: :ok | {:error, term()}
   def receive_push(bridge, payload) when is_map(payload) do
     GenServer.call(bridge, {:receive_push, payload})
+  end
+
+  @doc """
+  Returns the encoded JSON byte size of a push envelope.
+
+  This is the size checked against `:max_payload_bytes`. Provider-specific
+  wrappers may add their own overhead.
+  """
+  @spec serialized_size(envelope()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def serialized_size(envelope) when is_map(envelope) do
+    {:ok, envelope |> JSON.encode!() |> IO.iodata_to_binary() |> byte_size()}
+  rescue
+    error -> {:error, {:invalid_envelope, Exception.message(error)}}
   end
 
   def send_frame(bridge, peer_id, frame, opts \\ []) when is_binary(frame) do
@@ -79,12 +105,15 @@ defmodule Mob.Cellular.PushBridge do
   @impl true
   def handle_call({:send_frame, peer_id, frame, opts}, _from, state) do
     envelope = frame_envelope(peer_id, frame, opts)
+    start_time = System.monotonic_time()
 
     reply =
-      with :ok <- check_payload_size(envelope, state.max_payload_bytes),
-           :ok <- deliver(state.push_client, peer_id, envelope, opts) do
-        :ok
+      case check_payload_size(envelope, state.max_payload_bytes) do
+        :ok -> deliver(state.push_client, peer_id, envelope, opts)
+        {:error, reason} -> {:error, reason}
       end
+
+    emit_send_frame(peer_id, envelope, reply, start_time)
 
     {:reply, reply, state}
   end
@@ -96,15 +125,15 @@ defmodule Mob.Cellular.PushBridge do
       if recipients == [] do
         {:error, :recipients_required}
       else
-        recipients
-        |> Enum.map(&send_one(&1, frame, opts, state))
-        |> Enum.find(:ok, &match?({:error, _}, &1))
+        {:ok, broadcast_results(recipients, frame, opts, state)}
       end
 
     {:reply, reply, state}
   end
 
   def handle_call({:receive_push, payload}, _from, state) do
+    start_time = System.monotonic_time()
+
     reply =
       case decode_envelope(payload) do
         {:ok, {:frame, peer_id, frame, metadata}} ->
@@ -126,18 +155,46 @@ defmodule Mob.Cellular.PushBridge do
 
         {:error, reason} ->
           send(state.event_target, {:transport_error, reason})
+          emit_error(reason, %{operation: :receive_push})
           {:error, reason}
       end
+
+    emit_receive_push(payload, reply, start_time)
 
     {:reply, reply, state}
   end
 
+  defp broadcast_results(recipients, frame, opts, state) do
+    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online())
+    timeout = Keyword.get(opts, :timeout, @default_broadcast_timeout)
+
+    recipients
+    |> Task.async_stream(
+      fn peer_id ->
+        {peer_id, send_one(peer_id, frame, opts, state)}
+      end,
+      max_concurrency: max_concurrency,
+      ordered: false,
+      timeout: timeout,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(%{}, fn
+      {:ok, {peer_id, result}}, acc -> Map.put(acc, peer_id, result)
+      {:exit, reason}, acc -> Map.put(acc, :unknown, {:error, {:task_exit, reason}})
+    end)
+  end
+
   defp send_one(peer_id, frame, opts, state) do
     envelope = frame_envelope(peer_id, frame, opts)
+    start_time = System.monotonic_time()
 
-    with :ok <- check_payload_size(envelope, state.max_payload_bytes) do
-      deliver(state.push_client, peer_id, envelope, opts)
-    end
+    reply =
+      with :ok <- check_payload_size(envelope, state.max_payload_bytes) do
+        deliver(state.push_client, peer_id, envelope, opts)
+      end
+
+    emit_send_frame(peer_id, envelope, reply, start_time)
+    reply
   end
 
   defp require_event_target(opts) do
@@ -245,23 +302,31 @@ defmodule Mob.Cellular.PushBridge do
   end
 
   defp check_payload_size(envelope, max_payload_bytes) do
-    bytes = :erlang.external_size(envelope)
-
-    if bytes <= max_payload_bytes do
-      :ok
-    else
-      {:error, {:payload_too_large, bytes, max_payload_bytes}}
+    with {:ok, bytes} <- serialized_size(envelope) do
+      if bytes <= max_payload_bytes do
+        :ok
+      else
+        {:error, {:payload_too_large, bytes, max_payload_bytes}}
+      end
     end
   end
 
   defp deliver(nil, _peer_id, _envelope, _opts), do: {:error, :push_client_not_configured}
 
   defp deliver(client, peer_id, envelope, opts) do
-    apply(client, :deliver, [peer_id, envelope, opts])
+    client.deliver(peer_id, envelope, opts)
   rescue
     error in UndefinedFunctionError ->
       Logger.error("mob_cellular push client is invalid: #{Exception.message(error)}")
       {:error, {:invalid_push_client, client}}
+
+    error ->
+      Logger.error("mob_cellular push delivery failed: #{Exception.message(error)}")
+      {:error, {:push_client_exception, error.__struct__}}
+  catch
+    kind, reason ->
+      Logger.error("mob_cellular push delivery failed: #{inspect({kind, reason})}")
+      {:error, {:push_client_throw, kind, reason}}
   end
 
   defp config_value(config, key) when is_map(config) do
@@ -270,4 +335,40 @@ defmodule Mob.Cellular.PushBridge do
 
   defp config_value(config, key) when is_list(config), do: Keyword.get(config, key)
   defp config_value(_config, _key), do: nil
+
+  defp emit_send_frame(peer_id, envelope, result, start_time) do
+    emit(
+      [:mob, :cellular, :send_frame],
+      %{
+        duration: System.monotonic_time() - start_time,
+        payload_size: serialized_size(envelope) |> elem_or_zero()
+      },
+      %{peer_id: peer_id, result: result}
+    )
+
+    if match?({:error, _}, result),
+      do: emit_error(result, %{operation: :send_frame, peer_id: peer_id})
+  end
+
+  defp emit_receive_push(payload, result, start_time) do
+    emit(
+      [:mob, :cellular, :receive_push],
+      %{
+        duration: System.monotonic_time() - start_time,
+        payload_size: serialized_size(payload) |> elem_or_zero()
+      },
+      %{result: result}
+    )
+  end
+
+  defp emit_error(reason, metadata) do
+    emit([:mob, :cellular, :error], %{}, Map.put(metadata, :reason, reason))
+  end
+
+  defp emit(event, measurements, metadata) do
+    :telemetry.execute(event, measurements, metadata)
+  end
+
+  defp elem_or_zero({:ok, value}), do: value
+  defp elem_or_zero({:error, _reason}), do: 0
 end

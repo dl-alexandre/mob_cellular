@@ -5,6 +5,8 @@ defmodule Mob.Cellular.CarrierRejectedError do
 
   defexception [:carrier, :reason]
 
+  alias Mob.Cellular.Config
+
   @type t :: %__MODULE__{carrier: atom() | term(), reason: atom() | binary() | nil}
 
   @impl true
@@ -13,7 +15,7 @@ defmodule Mob.Cellular.CarrierRejectedError do
     Mob.Cellular: carrier #{inspect(carrier)} is rejected.
 
     Reason: #{inspect(reason || :unsupported_carrier)}
-    Supported carriers are #{inspect(Mob.Cellular.Config.supported_carriers())}.
+    Supported carriers are #{inspect(Config.supported_carriers())}.
     The primary carrier is #{inspect(Mob.Cellular.carrier())}.
     """
   end

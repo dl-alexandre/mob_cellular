@@ -5,3 +5,5 @@
 - Initial push-based cellular fallback transport.
 - Added plugin manifest for FCM/APNs setup.
 - Added carrier/config validation and docs.
+- Added telemetry events, JSON payload sizing, child specs, CI, and richer
+  broadcast result reporting.

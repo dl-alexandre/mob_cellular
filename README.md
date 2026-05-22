@@ -49,6 +49,16 @@ implements `Mob.Transport`.
 :ok = Mob.Transport.Adapter.send_frame(cellular, "peer-id", "payload")
 ```
 
+Broadcast delivery reports each recipient independently:
+
+```elixir
+{:ok, %{"peer-a" => :ok, "peer-b" => {:error, :provider_rejected}}} =
+  Mob.Cellular.PushBridge.broadcast_frame(bridge, "payload",
+    recipients: ["peer-a", "peer-b"],
+    max_concurrency: 8
+  )
+```
+
 The push client must implement:
 
 ```elixir
@@ -57,9 +67,80 @@ def deliver(peer_id, envelope, opts) do
 end
 ```
 
+A minimal FCM-style client can keep all credentials in the host app:
+
+```elixir
+defmodule MyApp.FcmPushClient do
+  def deliver(peer_id, envelope, opts) do
+    token = MyApp.DeviceRegistry.push_token!(peer_id)
+
+    body = %{
+      message: %{
+        token: token,
+        data: %{
+          "mob_cellular" => JSON.encode!(envelope)
+        },
+        android: %{
+          priority: Keyword.get(opts, :priority, "high"),
+          ttl: Keyword.get(opts, :ttl, "30s"),
+          collapse_key: Keyword.get(opts, :collapse_key)
+        }
+      }
+    }
+
+    Req.post(
+      "https://fcm.googleapis.com/v1/projects/#{MyApp.Firebase.project_id()}/messages:send",
+      json: body,
+      auth: {:bearer, MyApp.Firebase.access_token!()}
+    )
+    |> case do
+      {:ok, %{status: status}} when status in 200..299 -> :ok
+      {:ok, response} -> {:error, {:fcm_rejected, response.status}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+end
+```
+
 Inbound push payloads should be delivered to the bridge process with
 `Mob.Cellular.PushBridge.receive_push/2`. Decoded frames are emitted as
 canonical `Mob.Transport` events.
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant Bridge as Mob.Cellular.PushBridge
+  participant PushClient
+  participant Provider as FCM/APNs
+  participant Remote as Remote device
+
+  App->>Bridge: send_frame(peer_id, frame)
+  Bridge->>PushClient: deliver(peer_id, envelope, opts)
+  PushClient->>Provider: provider request
+  Provider->>Remote: push notification
+  Remote->>Bridge: receive_push(envelope)
+  Bridge->>App: {:frame, peer_id, frame}
+```
+
+## Observability
+
+The bridge emits Telemetry events:
+
+- `[:mob, :cellular, :send_frame]` with `:duration` and `:payload_size`
+- `[:mob, :cellular, :receive_push]` with `:duration` and `:payload_size`
+- `[:mob, :cellular, :error]` with `:operation` and `:reason`
+
+Payload budgets are measured against the JSON-encoded envelope size via
+`Mob.Cellular.PushBridge.serialized_size/1`. Provider wrappers may add their
+own overhead.
+
+## Assumptions
+
+- Higher layers own encryption, authentication, deduplication, replay handling,
+  and large-payload fetch.
+- `mob_cellular` owns only the fallback transport envelope and provider handoff.
+- Push credentials and provider-specific SDKs stay in the host application's
+  injected `push_client`.
 
 ## Limits
 
