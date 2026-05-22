@@ -2,7 +2,7 @@ defmodule Mob.Cellular.MixProject do
   use Mix.Project
 
   @github_url "https://github.com/dl-alexandre/mob_cellular"
-  @version "0.1.0"
+  @version "0.2.0"
   @description "Cellular fallback transport plugin for mob using push notification envelopes."
 
   def project do
