@@ -9,13 +9,18 @@ defmodule Mob.Cellular.PushBridge do
   Incoming push payloads can be delivered to the bridge with
   `receive_push/2`. Decoded frame envelopes are emitted to `:event_target` as
   canonical `Mob.Transport` events.
+
+  NOTE: Cellular remains on legacy event shapes (`{:frame, ...}`, `{:transport_up, ...}`,
+  `{:transport_down, ...}`, `{:transport_error, ...}`) until full alignment with
+  `Mob.Transport.Event` normalized `{:mob_transport, :cellular, ...}` shapes.
   """
 
   use GenServer
 
-  if Code.ensure_loaded?(Mob.Transport) do
-    @behaviour Mob.Transport
-  end
+  # Structurally implements the Mob.Transport contract (start_link/1, send_frame/4,
+  # optional stop/1 + broadcast_frame/3). The behaviour is intentionally not declared
+  # via @behaviour so this package stays self-contained and standalone-publishable;
+  # Mob.Transport.Adapter verifies the callbacks with function_exported?/3 at runtime.
 
   require Logger
 
@@ -85,6 +90,15 @@ defmodule Mob.Cellular.PushBridge do
 
   def stop(bridge), do: GenServer.stop(bridge)
 
+  @doc "Transport capabilities advertised by this plugin."
+  def capabilities, do: [:cellular]
+
+  @doc "Static transport metadata."
+  def metadata, do: %{}
+
+  @doc "Known peers (push transport has no live peer table)."
+  def peers(_bridge), do: []
+
   @impl true
   def init(opts) do
     event_target = Keyword.fetch!(opts, :event_target)
@@ -118,6 +132,7 @@ defmodule Mob.Cellular.PushBridge do
     {:reply, reply, state}
   end
 
+  @impl true
   def handle_call({:broadcast_frame, frame, opts}, _from, state) do
     recipients = Keyword.get(opts, :recipients, [])
 
@@ -131,6 +146,7 @@ defmodule Mob.Cellular.PushBridge do
     {:reply, reply, state}
   end
 
+  @impl true
   def handle_call({:receive_push, payload}, _from, state) do
     start_time = System.monotonic_time()
 
